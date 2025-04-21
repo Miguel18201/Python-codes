@@ -134,8 +134,8 @@ if __name__ == "__main__":
     # Configuración de los 8 nodos (debería ser única para cada máquina/nodo)
     # Este diccionario debería ser compartido entre todos los nodos
     TODOS_NODOS = {
-        1: ('192.168.1.1', 5001),
-        2: ('192.168.1.1', 5002),
+        1: ('192.168.136.131', 5001),
+        2: ('192.168.136.131', 5002),
         3: ('192.168.1.2', 5003),
         4: ('192.168.1.2', 5004),
         5: ('192.168.1.3', 5005),
