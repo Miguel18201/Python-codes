@@ -1,165 +1,302 @@
-### Codigo en python
-
 import socket
 import threading
 import datetime
-import time
 import pickle
-from concurrent.futures import ThreadPoolExecutor
-import random
+import time
 
-class Nodo:
-    def __init__(self, id_nodo, puerto, nodos_conocidos):
-        self.id_nodo = id_nodo
+class NodoMaestro:
+    def __init__(self, puerto, nodos_sucursales):
         self.puerto = puerto
-        self.nodos_conocidos = nodos_conocidos  # Diccionario {id_nodo: (ip, puerto)}
-        self.buzon_entrada = []
-        self.buzon_salida = []
+        self.nodos_sucursales = nodos_sucursales  # {id: (ip, puerto)}
+        self.inventario_global = {
+            'A001': 100,
+            'A002': 200,
+            'A003': 150
+        }
+        self.locks_articulos = {}  # articulo_id: id_sucursal_que_lo_uso
         self.lock = threading.Lock()
-        self.activo = True
-        
-    def guardar_mensaje(self, mensaje, es_recepcion):
-        """Almacena un mensaje en el buzón correspondiente"""
-        with self.lock:
-            if es_recepcion:
-                self.buzon_entrada.append(mensaje)
-            else:
-                self.buzon_salida.append(mensaje)
-            # Guardar en archivo para persistencia
-            with open(f"nodo_{self.id_nodo}_mensajes.txt", "a") as f:
-                tipo = "RECIBIDO" if es_recepcion else "ENVIADO"
-                f.write(f"{tipo} - {mensaje['timestamp']} - De {mensaje['origen']} a {mensaje['destino']}: {mensaje['contenido']}\n")
 
     def servidor(self):
-        """Escucha conexiones entrantes y recibe mensajes"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(('0.0.0.0', self.puerto))
             s.listen()
-            print(f"Nodo {self.id_nodo} escuchando en puerto {self.puerto}")
-            
-            while self.activo:
-                try:
-                    conn, addr = s.accept()
-                    with conn:
-                        data = conn.recv(4096)
-                        if data:
-                            mensaje = pickle.loads(data)
-                            self.guardar_mensaje(mensaje, es_recepcion=True)
-                            print(f"Nodo {self.id_nodo} recibió mensaje de {mensaje['origen']}: {mensaje['contenido']}")
-                            
-                            # Enviar confirmación de recepción
-                            respuesta = {
-                                'origen': self.id_nodo,
-                                'destino': mensaje['origen'],
-                                'contenido': f"Confirmación de recepción para mensaje: {mensaje['contenido']}",
-                                'timestamp': datetime.datetime.now().isoformat()
-                            }
-                            conn.sendall(pickle.dumps(respuesta))
-                except Exception as e:
-                    print(f"Error en servidor nodo {self.id_nodo}: {e}")
-    
-    def enviar_mensaje(self, destino_id, contenido):
-        """Envía un mensaje a otro nodo"""
-        if destino_id not in self.nodos_conocidos:
-            print(f"Error: Nodo {destino_id} desconocido")
+            print(f"Maestro escuchando en puerto {self.puerto}")
+            while True:
+                conn, addr = s.accept()
+                threading.Thread(target=self.manejar_conexion, args=(conn,)).start()
+
+    def manejar_conexion(self, conn):
+        with conn:
+            data = b''
+            while True:
+                parte = conn.recv(4096)
+                if not parte:
+                    break
+                data += parte
+            if not data:
+                return
+            mensaje = pickle.loads(data)
+            tipo = mensaje.get('tipo')
+            respuesta = {}
+
+            if tipo == 'solicitar_inventario':
+                # Envía inventario completo (podrías enviar solo parte o actualizaciones)
+                respuesta = {'tipo': 'inventario', 'inventario': self.inventario_global}
+
+            elif tipo == 'bloquear_articulo':
+                articulo = mensaje.get('articulo_id')
+                sucursal = mensaje.get('origen')
+                with self.lock:
+                    if articulo not in self.locks_articulos:
+                        self.locks_articulos[articulo] = sucursal
+                        respuesta = {'tipo': 'lock_confirmado', 'articulo_id': articulo}
+                    else:
+                        respuesta = {'tipo': 'lock_denegado', 'articulo_id': articulo}
+
+            elif tipo == 'liberar_articulo':
+                articulo = mensaje.get('articulo_id')
+                sucursal = mensaje.get('origen')
+                with self.lock:
+                    if self.locks_articulos.get(articulo) == sucursal:
+                        del self.locks_articulos[articulo]
+                        respuesta = {'tipo': 'unlock_confirmado', 'articulo_id': articulo}
+                    else:
+                        respuesta = {'tipo': 'unlock_denegado', 'articulo_id': articulo}
+
+            elif tipo == 'actualizar_inventario':
+                # Una sucursal informa que vendió X cantidad y el maestro actualiza
+                articulo = mensaje.get('articulo_id')
+                cantidad = mensaje.get('cantidad')
+                with self.lock:
+                    if articulo in self.inventario_global:
+                        self.inventario_global[articulo] -= cantidad
+                respuesta = {'tipo': 'actualizacion_recibida'}
+
+            elif tipo == 'consultar_clientes':
+                # Para simplicidad, maestro no maneja clientes, solo reenvía consulta a sucursales
+                respuesta = {'tipo': 'no_implementado'}
+
+            # Envía respuesta
+            conn.sendall(pickle.dumps(respuesta))
+
+    def distribuir_inventario(self):
+        # Ejemplo simple: al inicio o cada cierto tiempo se envía inventario a sucursales
+        for id_suc, (ip, puerto) in self.nodos_sucursales.items():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((ip, puerto))
+                    mensaje = {'tipo': 'actualizar_inventario', 'inventario': self.inventario_global}
+                    s.sendall(pickle.dumps(mensaje))
+            except Exception as e:
+                print(f"Error al distribuir inventario a sucursal {id_suc}: {e}")
+
+    def iniciar(self):
+        threading.Thread(target=self.servidor, daemon=True).start()
+        print("Nodo Maestro iniciado.")
+        while True:
+            self.distribuir_inventario()
+            time.sleep(60)  # Distribuye cada 60 seg (ejemplo)
+
+class NodoSucursal:
+    def __init__(self, id_sucursal, puerto, ip_maestro, puerto_maestro, nodos_otras_sucursales):
+        self.id = id_sucursal
+        self.puerto = puerto
+        self.ip_maestro = ip_maestro
+        self.puerto_maestro = puerto_maestro
+        self.nodos_otras_sucursales = nodos_otras_sucursales
+        self.inventario = {}
+        self.clientes = {}  # {cliente_id: datos}
+        self.lock = threading.Lock()
+
+    def servidor(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('0.0.0.0', self.puerto))
+            s.listen()
+            print(f"Sucursal {self.id} escuchando en puerto {self.puerto}")
+            while True:
+                conn, addr = s.accept()
+                threading.Thread(target=self.manejar_conexion, args=(conn,)).start()
+
+    def manejar_conexion(self, conn):
+        with conn:
+            data = b''
+            while True:
+                parte = conn.recv(4096)
+                if not parte:
+                    break
+                data += parte
+            if not data:
+                return
+            mensaje = pickle.loads(data)
+            tipo = mensaje.get('tipo')
+            respuesta = {}
+
+            if tipo == 'actualizar_inventario':
+                # Recibe actualización de maestro
+                inventario_nuevo = mensaje.get('inventario')
+                with self.lock:
+                    self.inventario = inventario_nuevo
+                respuesta = {'tipo': 'inventario_actualizado'}
+
+            elif tipo == 'consulta_cliente':
+                cliente_id = mensaje.get('cliente_id')
+                with self.lock:
+                    datos = self.clientes.get(cliente_id)
+                respuesta = {'tipo': 'respuesta_cliente', 'datos': datos}
+
+            elif tipo == 'actualizar_cliente':
+                cliente_id = mensaje.get('cliente_id')
+                datos = mensaje.get('datos')
+                with self.lock:
+                    self.clientes[cliente_id] = datos
+                # Notificar a otras sucursales
+                threading.Thread(target=self.propagar_cliente, args=(cliente_id, datos)).start()
+                respuesta = {'tipo': 'cliente_actualizado'}
+
+            elif tipo == 'comprar_articulo':
+                articulo = mensaje.get('articulo_id')
+                cantidad = mensaje.get('cantidad')
+                exito = self.comprar(articulo, cantidad)
+                respuesta = {'tipo': 'respuesta_compra', 'exito': exito}
+
+            conn.sendall(pickle.dumps(respuesta))
+
+    def propagar_cliente(self, cliente_id, datos):
+        for id_suc, (ip, puerto) in self.nodos_otras_sucursales.items():
+            if id_suc == self.id:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((ip, puerto))
+                    mensaje = {
+                        'tipo': 'actualizar_cliente',
+                        'cliente_id': cliente_id,
+                        'datos': datos
+                    }
+                    s.sendall(pickle.dumps(mensaje))
+            except:
+                print(f"Error propagando cliente a sucursal {id_suc}")
+
+    def comprar(self, articulo_id, cantidad):
+        # Paso 1: pedir lock al maestro
+        if not self.pedir_lock(articulo_id):
+            print(f"Compra falló: articulo {articulo_id} bloqueado")
             return False
-        
-        ip, puerto = self.nodos_conocidos[destino_id]
-        mensaje = {
-            'origen': self.id_nodo,
-            'destino': destino_id,
-            'contenido': contenido,
-            'timestamp': datetime.datetime.now().isoformat()
-        }
-        
+
+        # Paso 2: verificar inventario local
+        with self.lock:
+            stock = self.inventario.get(articulo_id, 0)
+            if stock < cantidad:
+                print(f"Compra falló: no hay stock suficiente de {articulo_id}")
+                self.liberar_lock(articulo_id)
+                return False
+
+            # Actualizar inventario local
+            self.inventario[articulo_id] -= cantidad
+
+        # Paso 3: notificar venta al maestro para actualizar inventario global
+        self.notificar_venta(articulo_id, cantidad)
+
+        # Paso 4: liberar lock
+        self.liberar_lock(articulo_id)
+
+        print(f"Compra exitosa de {cantidad} unidades de {articulo_id}")
+        return True
+
+    def pedir_lock(self, articulo_id):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((ip, puerto))
+                s.connect((self.ip_maestro, self.puerto_maestro))
+                mensaje = {
+                    'tipo': 'bloquear_articulo',
+                    'articulo_id': articulo_id,
+                    'origen': self.id
+                }
                 s.sendall(pickle.dumps(mensaje))
-                self.guardar_mensaje(mensaje, es_recepcion=False)
-                
-                # Esperar confirmación
                 data = s.recv(4096)
-                if data:
-                    respuesta = pickle.loads(data)
-                    self.guardar_mensaje(respuesta, es_recepcion=True)
-                    print(f"Nodo {self.id_nodo} recibió confirmación de {destino_id}: {respuesta['contenido']}")
-                    return True
-        except Exception as e:
-            print(f"Error al enviar mensaje desde nodo {self.id_nodo} a {destino_id}: {e}")
+                respuesta = pickle.loads(data)
+                return respuesta.get('tipo') == 'lock_confirmado'
+        except:
             return False
-    
-    def interfaz_usuario(self):
-        """Interfaz para que el usuario envíe mensajes"""
-        while self.activo:
-            print("\n--- Menú ---")
-            print("Nodos disponibles:", ", ".join(str(id) for id in self.nodos_conocidos if id != self.id_nodo))
-            destino = input("Ingrese ID del nodo destino (o 'q' para salir): ")
-            if destino.lower() == 'q':
-                self.activo = False
-                break
-            
-            try:
-                destino_id = int(destino)
-                if destino_id == self.id_nodo:
-                    print("No puedes enviarte mensajes a ti mismo")
-                    continue
-                if destino_id not in self.nodos_conocidos:
-                    print("ID de nodo inválido")
-                    continue
-                
-                contenido = input("Ingrese el mensaje: ")
-                if contenido:
-                    # Usar ThreadPoolExecutor para no bloquear la interfaz
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        executor.submit(self.enviar_mensaje, destino_id, contenido)
-            except ValueError:
-                print("ID debe ser un número")
 
-def iniciar_nodo(config):
-    """Inicia un nodo con la configuración dada"""
-    nodo = Nodo(config['id'], config['puerto'], config['nodos_conocidos'])
-    
-    # Iniciar servidor en segundo plano
-    threading.Thread(target=nodo.servidor, daemon=True).start()
-    
-    # Pequeña pausa para asegurar que el servidor esté listo
-    time.sleep(1)
-    
-    # Iniciar interfaz de usuario
-    nodo.interfaz_usuario()
+    def liberar_lock(self, articulo_id):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((self.ip_maestro, self.puerto_maestro))
+                mensaje = {
+                    'tipo': 'liberar_articulo',
+                    'articulo_id': articulo_id,
+                    'origen': self.id
+                }
+                s.sendall(pickle.dumps(mensaje))
+                s.recv(4096)  # Ignorar respuesta
+        except:
+            pass
+
+    def notificar_venta(self, articulo_id, cantidad):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((self.ip_maestro, self.puerto_maestro))
+                mensaje = {
+                    'tipo': 'actualizar_inventario',
+                    'articulo_id': articulo_id,
+                    'cantidad': cantidad
+                }
+                s.sendall(pickle.dumps(mensaje))
+                s.recv(4096)  # Ignorar respuesta
+        except:
+            pass
+
+    def iniciar(self):
+        threading.Thread(target=self.servidor, daemon=True).start()
+        print(f"Sucursal {self.id} iniciada")
+        # Al iniciar, consultar inventario maestro
+        self.consultar_inventario_maestro()
+
+    def consultar_inventario_maestro(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((self.ip_maestro, self.puerto_maestro))
+                mensaje = {'tipo': 'solicitar_inventario'}
+                s.sendall(pickle.dumps(mensaje))
+                data = s.recv(4096)
+                respuesta = pickle.loads(data)
+                if respuesta.get('tipo') == 'inventario':
+                    with self.lock:
+                        self.inventario = respuesta['inventario']
+                    print(f"Sucursal {self.id} actualizó inventario desde maestro")
+        except Exception as e:
+            print(f"Error consultando inventario maestro: {e}")
+
+# Ejemplo de ejecución
 
 if __name__ == "__main__":
-    # Configuración de los 8 nodos (debería ser única para cada máquina/nodo)
-    # Este diccionario debería ser compartido entre todos los nodos
-    TODOS_NODOS = {
-        1: ('192.168.136.131', 5001),
-        2: ('192.168.136.131', 5002),
-        3: ('192.168.116.128', 5003),
-        4: ('192.168.116.128', 5004),
-        5: ('192.168.1.3', 5005),
-        6: ('192.168.1.3', 5006),
-        7: ('192.168.1.4', 5007),
-        8: ('192.168.1.4', 5008)
+    # Configuración nodos
+    NODOS_SUCURSALES = {
+        2: ('127.0.0.1', 6002),
+        3: ('127.0.0.1', 6003),
     }
-    
-    # Cada nodo debe tener su propia configuración
-    # En la práctica, esto debería estar en archivos de configuración separados
-    # o pasarse como argumentos al script
-    
-    print("Seleccione el número de nodo a iniciar (1-8):")
-    id_nodo = int(input())
-    
-    if id_nodo not in TODOS_NODOS:
-        print("ID de nodo inválido")
-        exit(1)
-    
-    # Configuración para este nodo específico
-    config = {
-        'id': id_nodo,
-        'puerto': TODOS_NODOS[id_nodo][1],
-        'nodos_conocidos': TODOS_NODOS
-    }
-    
-    iniciar_nodo(config)
+
+    # Iniciar maestro en hilo aparte
+    maestro = NodoMaestro(puerto=6000, nodos_sucursales=NODOS_SUCURSALES)
+    threading.Thread(target=maestro.iniciar, daemon=True).start()
+
+    # Iniciar sucursales
+    sucursal2 = NodoSucursal(2, 6002, '127.0.0.1', 6000, NODOS_SUCURSALES)
+    sucursal3 = NodoSucursal(3, 6003, '127.0.0.1', 6000, NODOS_SUCURSALES)
+    sucursal2.iniciar()
+    sucursal3.iniciar()
+
+    # Demo compra en sucursal 2
+    time.sleep(2)
+    exito = sucursal2.comprar('A001', 5)
+    print("Compra sucursal 2:", "Exitosa" if exito else "Fallida")
+
+    # Demo actualización clientes
+    cliente_demo = {'nombre': 'Juan Pérez', 'email': 'juan@example.com'}
+    sucursal2.manejar_conexion = lambda conn=None: None  # deshabilitar servidor para demo
+    sucursal2.propagar_cliente('cliente1', cliente_demo)
+
+    time.sleep(5)
