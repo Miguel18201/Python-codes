@@ -21,33 +21,33 @@ logging.basicConfig(
 )
 
 class NodoInventario:
-    def __init__(self, id_nodo, puerto, nodos_conocidos, es_maestro=False):
+   def __init__(self, id_nodo, puerto, nodos_conocidos, db_config, es_maestro=False):
         self.id_nodo = id_nodo
         self.puerto = puerto
         self.nodos_conocidos = nodos_conocidos
         self.es_maestro = es_maestro
-        self.maestro_actual = 1  # Por defecto el nodo 1 es maestro
+        self.maestro_actual = 1
         self.activo = True
         self.lock = threading.Lock()
-        self.transaccion_activa = False
-        self.eleccion_en_curso = False
-        
-        # Conexión a PostgreSQL
-        self.db_conn = self.conectar_postgresql()
-        self.inicializar_bd()
+        self.db_config = db_config
+        self.db_conn = None
+
+        self._conectar_bd()
         
     def conectar_postgresql(self):
+         """Establece conexión con PostgreSQL"""
         try:
-            conn = psycopg2.connect(
-                dbname="inventario_distribuido",
-                user="postgres",
-                password="tu_password",
-                host="localhost"
+            self.db_conn = psycopg2.connect(
+                dbname=self.db_config['inventario_distribuido'],
+                user=self.db_config['postgres'],
+                password=self.db_config['1234'],
+                host=self.db_config['localhost'],
+                port=self.db_config.get('port', 5432)
             )
-            return conn
+            logging.info("Conexión a PostgreSQL establecida")
         except Exception as e:
             logging.error(f"Error conectando a PostgreSQL: {e}")
-            return None
+            self.db_conn = None
             
     def inicializar_bd(self):
         if not self.db_conn:
@@ -117,19 +117,19 @@ class NodoInventario:
             self.db_conn.rollback()
             
     def servidor(self):
-        """Escucha conexiones entrantes"""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('0.0.0.0', self.puerto))
-            s.listen()
-            logging.info(f"Nodo {self.id_nodo} escuchando en puerto {self.puerto}")
-            
-            while self.activo:
-                try:
+            try:
+                s.bind(('0.0.0.0', self.puerto))
+                s.listen()
+                logging.info(f"Nodo {self.id_nodo} escuchando en puerto {self.puerto}")
+                
+                while self.activo:
                     conn, addr = s.accept()
                     threading.Thread(target=self.manejar_conexion, args=(conn,)).start()
-                except Exception as e:
-                    logging.error(f"Error en servidor nodo {self.id_nodo}: {e}")
+            except Exception as e:
+                logging.error(f"Error en servidor: {e}")
+                self.activo = False
     
     def manejar_conexion(self, conn):
         """Maneja una conexión entrante"""
@@ -674,14 +674,14 @@ class NodoInventario:
             return False
 
 def iniciar_nodo_inventario(config):
-    """Inicia un nodo del sistema de inventario"""
-    nodo = NodoInventario(
-        id_nodo=config['id_nodo'],
-        puerto=config['puerto'],
-        nodos_conocidos=config['nodos_conocidos'],
-        es_maestro=(config['id'] == 1)  # El nodo 1 es maestro inicial
-        db.config=config['db_config']
-    )
+   try:
+        nodo = NodoInventario(
+            id_nodo=config['id_nodo'],
+            puerto=config['puerto'],
+            nodos_conocidos=config['nodos_conocidos'],
+            db_config=config['db_config'],  # Configuración de BD requerida
+            es_maestro=config.get('es_maestro', False)
+        )
     
     # Iniciar servidor en segundo plano
     threading.Thread(target=nodo.servidor, daemon=True).start()
@@ -696,18 +696,21 @@ def iniciar_nodo_inventario(config):
     
     # Iniciar interfaz de usuario
     nodo.interfaz_usuario()
+except Exception as e:
+        logging.error(f"Error al iniciar nodo: {e}")
+
 
 if __name__ == "__main__":
     # Configuración de los nodos (debe ser consistente en todos)
     TODOS_NODOS = {
-        1: ('192.168.1.1', 6001),
-        2: ('192.168.1.1', 6002),
-        3: ('192.168.1.2', 6003),
-        4: ('192.168.1.2', 6004),
-        5: ('192.168.1.3', 6005),
-        6: ('192.168.1.3', 6006),
-        7: ('192.168.1.4', 6007),
-        8: ('192.168.1.4', 6008)
+        1: ('192.168.116.133', 5001),
+        2: ('192.168.116.128', 5002),
+        3: ('192.168.116.134', 5003),
+        4: ('192.168.1.2', 5004),
+        5: ('192.168.1.3', 5005),
+        6: ('192.168.1.3', 5006),
+        7: ('192.168.1.4', 5007),
+        8: ('192.168.1.4', 5008)
     }
     
     print("=== SISTEMA DE INVENTARIO DISTRIBUIDO ===")
@@ -723,15 +726,14 @@ if __name__ == "__main__":
         'id': id_nodo,
         'puerto': TODOS_NODOS[id_nodo][1],
         'nodos_conocidos': TODOS_NODOS
-
-        'db_config': {
-            'dabase': 'inventario_distribuido',
-                'user': 'postgres',
-                'password': '1234',
-                'host': 'localhost',
-                'port': 5432
-
-    }
+        }, 
+       'db_config': {  
+            'database': 'inventario_distribuido',
+            'user': 'nodo_inventario',
+            'password': '1234',  # Debe coincidir con PostgreSQL
+            'host': 'localhost',
+            'port': 5432
+        }
     }
     
     # Configurar PostgreSQL antes de iniciar
