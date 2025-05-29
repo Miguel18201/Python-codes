@@ -3,53 +3,52 @@ import threading
 import datetime
 import time
 import pickle
+from concurrent.futures import ThreadPoolExecutor
+import random
 import psycopg2
-from psycopg2 import sql, errors
+from psycopg2 import sql
 import logging
 import hashlib
-import sys
-from concurrent.futures import ThreadPoolExecutor
 
 # Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('nodo_inventario.log'),
+        logging.FileHandler(f'nodo_inventario.log'),
         logging.StreamHandler()
     ]
 )
 
 class NodoInventario:
-    def __init__(self, id_nodo, puerto, nodos_conocidos, db_config, es_maestro=False):
+    def __init__(self, id_nodo, puerto, nodos_conocidos, es_maestro=False):
         self.id_nodo = id_nodo
         self.puerto = puerto
         self.nodos_conocidos = nodos_conocidos
         self.es_maestro = es_maestro
-        self.maestro_actual = 1
+        self.maestro_actual = 1  # Por defecto el nodo 1 es maestro
         self.activo = True
         self.lock = threading.Lock()
-        self.db_config = db_config
-        self.db_conn = None
+        self.transaccion_activa = False
+        self.eleccion_en_curso = False
         
-        # Conectar a PostgreSQL al iniciar
-        self._conectar_bd()
-
-    def _conectar_bd(self):
-        """Establece conexión con PostgreSQL"""
+        # Conexión a PostgreSQL
+        self.db_conn = self.conectar_postgresql()
+        self.inicializar_bd()
+        
+    def conectar_postgresql(self):
         try:
-            self.db_conn = psycopg2.connect(
-                dbname=self.db_config['database'],
-                user=self.db_config['user'],
-                password=self.db_config['password'],
-                host=self.db_config['host'],
-                port=self.db_config.get('port', 5432)
+            conn = psycopg2.connect(
+                dbname="inventario_distribuido",
+                user="postgres",
+                password="tu_password",
+                host="localhost"
             )
-            logging.info("Conexión a PostgreSQL establecida")
+            return conn
         except Exception as e:
             logging.error(f"Error conectando a PostgreSQL: {e}")
-            self.db_conn = None
-    
+            return None
+            
     def inicializar_bd(self):
         if not self.db_conn:
             return
@@ -121,70 +120,83 @@ class NodoInventario:
         """Escucha conexiones entrantes"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(('0.0.0.0', self.puerto))
-                s.listen()
-                logging.info(f"Nodo {self.id_nodo} escuchando en puerto {self.puerto}")
-                
-                while self.activo:
+            s.bind(('0.0.0.0', self.puerto))
+            s.listen()
+            logging.info(f"Nodo {self.id_nodo} escuchando en puerto {self.puerto}")
+            
+            while self.activo:
+                try:
                     conn, addr = s.accept()
                     threading.Thread(target=self.manejar_conexion, args=(conn,)).start()
-            except Exception as e:
-                logging.error(f"Error en servidor: {e}")
-                self.activo = False
+                except Exception as e:
+                    logging.error(f"Error en servidor nodo {self.id_nodo}: {e}")
     
     def manejar_conexion(self, conn):
-       """Maneja una conexión entrante"""
-       with conn:
-           try:
-               data = conn.recv(4096)
-               if data:
-                   mensaje = pickle.loads(data)
-                   respuesta = self.procesar_mensaje(mensaje)
-                   conn.sendall(pickle.dumps(respuesta))
-           except Exception as e:
-               logging.error(f"Error manejando conexión: {e}")
+        """Maneja una conexión entrante"""
+        with conn:
+            try:
+                data = conn.recv(4096)
+                if data:
+                    mensaje = pickle.loads(data)
+                    logging.info(f"Nodo {self.id_nodo} recibió mensaje de {mensaje['origen']}: {mensaje['tipo']}")
+                    
+                    # Procesar mensaje según tipo
+                    respuesta = self.procesar_mensaje(mensaje)
+                    
+                    # Enviar respuesta
+                    conn.sendall(pickle.dumps(respuesta))
+            except Exception as e:
+                logging.error(f"Error manejando conexión: {e}")
                 
     def procesar_mensaje(self, mensaje):
-        """Procesa mensajes según tipo"""
+        """Procesa diferentes tipos de mensajes"""
         try:
             if mensaje['tipo'] == 'consulta_inventario':
                 return self.consultar_inventario()
+            elif mensaje['tipo'] == 'consulta_clientes':
+                return self.consultar_clientes()
             elif mensaje['tipo'] == 'venta_articulo':
                 return self.procesar_venta(mensaje['datos'])
             elif mensaje['tipo'] == 'agregar_articulo':
                 return self.agregar_articulo(mensaje['datos'])
+            elif mensaje['tipo'] == 'eleccion_maestro':
+                return self.participar_eleccion(mensaje)
+            elif mensaje['tipo'] == 'confirmacion_maestro':
+                self.actualizar_maestro(mensaje['nuevo_maestro'])
+                return {'estado': 'ok'}
+            elif mensaje['tipo'] == 'redistribuir':
+                return self.redistribuir_articulos(mensaje['datos'])
             else:
-                return {'estado': 'error', 'mensaje': 'Tipo no válido'}
+                return {'estado': 'error', 'mensaje': 'Tipo de mensaje no reconocido'}
         except Exception as e:
             logging.error(f"Error procesando mensaje: {e}")
             return {'estado': 'error', 'mensaje': str(e)}
     
     # Funciones de negocio
     def consultar_inventario(self):
-        """Consulta inventario local"""
-        if not self.db_conn:
-            return {'estado': 'error', 'mensaje': 'BD no conectada'}
-        
+        """Consulta el inventario local"""
         try:
-            with self.db_conn.cursor() as cur:
-                cur.execute("""
-                    SELECT i.id_articulo, i.nombre, i.descripcion, 
-                           ds.cantidad, i.precio_venta
-                    FROM inventario i
-                    JOIN distribucion_sucursal ds ON i.id_articulo = ds.id_articulo
-                    WHERE ds.id_sucursal = %s
-                """, (self.id_nodo,))
-                
-                inventario = [{
-                    'id': row[0],
+            cur = self.db_conn.cursor()
+            cur.execute("""
+                SELECT i.id_articulo, i.nombre, i.descripcion, 
+                       ds.cantidad, ds.id_sucursal, i.cantidad_total
+                FROM inventario i
+                JOIN distribucion_sucursal ds ON i.id_articulo = ds.id_articulo
+                WHERE ds.id_sucursal = %s
+            """, (self.id_nodo,))
+            
+            inventario = []
+            for row in cur.fetchall():
+                inventario.append({
+                    'id_articulo': row[0],
                     'nombre': row[1],
                     'descripcion': row[2],
                     'cantidad': row[3],
-                    'precio': float(row[4])
-                } for row in cur.fetchall()]
+                    'sucursal': row[4],
+                    'cantidad_total': row[5]
+                })
                 
-                return {'estado': 'ok', 'inventario': inventario}
+            return {'estado': 'ok', 'inventario': inventario}
         except Exception as e:
             logging.error(f"Error consultando inventario: {e}")
             return {'estado': 'error', 'mensaje': str(e)}
@@ -212,64 +224,54 @@ class NodoInventario:
             return {'estado': 'error', 'mensaje': str(e)}
     
     def procesar_venta(self, datos_venta):
-        """Procesa una venta con transacción"""
-        if not self.db_conn:
-            return {'estado': 'error', 'mensaje': 'BD no conectada'}
-        
-        try:
-            with self.db_conn.cursor() as cur:
-                # Iniciar transacción
-                self.db_conn.autocommit = False
-                
-                # 1. Verificar stock
+        """Procesa una venta con exclusión mutua"""
+        with self.lock:
+            try:
+                # Verificar disponibilidad
+                cur = self.db_conn.cursor()
                 cur.execute("""
                     SELECT cantidad FROM distribucion_sucursal
                     WHERE id_articulo = %s AND id_sucursal = %s FOR UPDATE
                 """, (datos_venta['id_articulo'], self.id_nodo))
-                stock = cur.fetchone()[0]
                 
-                if stock < datos_venta['cantidad']:
-                    raise ValueError("Stock insuficiente")
+                cantidad = cur.fetchone()[0]
+                if cantidad < datos_venta['cantidad']:
+                    return {'estado': 'error', 'mensaje': 'Stock insuficiente'}
                 
-                # 2. Obtener precio
-                cur.execute("""
-                    SELECT precio_venta FROM inventario
-                    WHERE id_articulo = %s
-                """, (datos_venta['id_articulo'],))
-                precio = cur.fetchone()[0]
-                
-                # 3. Registrar venta
-                guia = self._generar_guia()
-                cur.execute("""
-                    INSERT INTO ventas (
-                        id_articulo, id_cliente, id_sucursal,
-                        cantidad, precio_unitario, guia_envio
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    datos_venta['id_articulo'],
-                    datos_venta['id_cliente'],
-                    self.id_nodo,
-                    datos_venta['cantidad'],
-                    precio,
-                    guia
-                ))
-                
-                # 4. Actualizar stock
+                # Actualizar inventario
+                nueva_cantidad = cantidad - datos_venta['cantidad']
                 cur.execute("""
                     UPDATE distribucion_sucursal
-                    SET cantidad = cantidad - %s
+                    SET cantidad = %s
                     WHERE id_articulo = %s AND id_sucursal = %s
-                """, (datos_venta['cantidad'], datos_venta['id_articulo'], self.id_nodo))
+                """, (nueva_cantidad, datos_venta['id_articulo'], self.id_nodo))
+                
+                # Actualizar inventario general
+                cur.execute("""
+                    UPDATE inventario
+                    SET cantidad_disponible = cantidad_disponible - %s
+                    WHERE id_articulo = %s
+                """, (datos_venta['cantidad'], datos_venta['id_articulo']))
+                
+                # Generar guía de envío
+                guia_envio = self.generar_guia_envio(datos_venta)
+                
+                # Registrar venta
+                cur.execute("""
+                    INSERT INTO ventas (id_articulo, id_cliente, id_sucursal, guia_envio)
+                    VALUES (%s, %s, %s, %s)
+                """, (datos_venta['id_articulo'], datos_venta['id_cliente'], self.id_nodo, guia_envio))
                 
                 self.db_conn.commit()
-                return {'estado': 'ok', 'guia': guia}
                 
-        except Exception as e:
-            self.db_conn.rollback()
-            logging.error(f"Error en venta: {e}")
-            return {'estado': 'error', 'mensaje': str(e)}
-        finally:
-            self.db_conn.autocommit = True 
+                # Replicar cambios a otros nodos
+                self.replicar_venta(datos_venta, nueva_cantidad, guia_envio)
+                
+                return {'estado': 'ok', 'guia_envio': guia_envio}
+            except Exception as e:
+                self.db_conn.rollback()
+                logging.error(f"Error procesando venta: {e}")
+                return {'estado': 'error', 'mensaje': str(e)}
     
     def generar_guia_envio(self, datos_venta):
         """Genera un ID único para la guía de envío"""
@@ -297,48 +299,44 @@ class NodoInventario:
                     logging.error(f"Error replicando a nodo {nodo_id}: {e}")
     
     def agregar_articulo(self, datos_articulo):
-        """Agrega un artículo nuevo con distribución automática"""
-        if not self.db_conn:
-            return {'estado': 'error', 'mensaje': 'BD no conectada'}
-        
-        try:
-            with self.db_conn.cursor() as cur:
-                self.db_conn.autocommit = False
+        """Agrega un nuevo artículo al inventario distribuido"""
+        if not self.es_maestro and self.maestro_actual != self.id_nodo:
+            # Redirigir al nodo maestro
+            return self.redirigir_a_maestro('agregar_articulo', datos_articulo)
+            
+        with self.lock:
+            try:
+                cur = self.db_conn.cursor()
                 
-                # 1. Insertar en inventario
+                # Insertar en inventario general
                 cur.execute("""
-                    INSERT INTO inventario (
-                        nombre, descripcion, cantidad_total,
-                        cantidad_disponible, precio_venta
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id_articulo
-                """, (
-                    datos_articulo['nombre'],
-                    datos_articulo['descripcion'],
-                    datos_articulo['cantidad'],
-                    datos_articulo['cantidad'],
-                    datos_articulo.get('precio_venta', 0.0)
-                ))
+                    INSERT INTO inventario (nombre, descripcion, cantidad_total, cantidad_disponible)
+                    VALUES (%s, %s, %s, %s) RETURNING id_articulo
+                """, (datos_articulo['nombre'], datos_articulo['descripcion'], 
+                      datos_articulo['cantidad'], datos_articulo['cantidad']))
+                
                 id_articulo = cur.fetchone()[0]
                 
-                # 2. Distribuir en sucursales
-                sucursales = self._distribuir_articulo(id_articulo, datos_articulo['cantidad'])
+                # Distribuir entre sucursales
+                sucursales = self.obtener_sucursales_optimas(datos_articulo['cantidad'])
                 for sucursal, cantidad in sucursales.items():
                     cur.execute("""
-                        INSERT INTO distribucion_sucursal (
-                            id_articulo, id_sucursal, cantidad
-                        ) VALUES (%s, %s, %s)
-                    """, (id_articulo, sucursal, cantidad))
+                        INSERT INTO distribucion_sucursal 
+                        (id_articulo, id_sucursal, cantidad, espacio_disponible)
+                        VALUES (%s, %s, %s, %s)
+                    """, (id_articulo, sucursal, cantidad, 
+                          self.calcular_espacio_disponible(sucursal) - cantidad))
                 
                 self.db_conn.commit()
-                return {'estado': 'ok', 'id_articulo': id_articulo}
                 
-        except Exception as e:
-            self.db_conn.rollback()
-            logging.error(f"Error agregando artículo: {e}")
-            return {'estado': 'error', 'mensaje': str(e)}
-        finally:
-            self.db_conn.autocommit = True
+                # Replicar a otros nodos
+                self.replicar_nuevo_articulo(id_articulo, datos_articulo, sucursales)
+                
+                return {'estado': 'ok', 'id_articulo': id_articulo}
+            except Exception as e:
+                self.db_conn.rollback()
+                logging.error(f"Error agregando artículo: {e}")
+                return {'estado': 'error', 'mensaje': str(e)}
     
     def obtener_sucursales_optimas(self, cantidad_total):
         """Distribuye el artículo entre sucursales con más espacio"""
@@ -405,35 +403,37 @@ class NodoInventario:
                 except Exception as e:
                     logging.error(f"Error replicando a nodo {nodo_id}: {e}")
     
-    def _distribuir_articulo(self, id_articulo, cantidad_total):
-       """Distribuye un artículo entre sucursales"""
-       try:
-           with self.db_conn.cursor() as cur:
-               cur.execute("""
-                   SELECT id_sucursal, capacidad_maxima - COALESCE(SUM(cantidad), 0) as espacio
-                   FROM distribucion_sucursal
-                   GROUP BY id_sucursal, capacidad_maxima
-                   ORDER BY espacio DESC
-               """)
-               
-               sucursales = {}
-               resultados = cur.fetchall()
-               total_espacio = max(sum(row[1] for row in resultados), 1)
-               
-               for row in resultados:
-                   proporcion = row[1] / total_espacio
-                   sucursales[row[0]] = int(cantidad_total * proporcion)
-               
-               # Ajustar redondeo
-               diferencia = cantidad_total - sum(sucursales.values())
-               if diferencia != 0:
-                   sucursales[resultados[0][0]] += diferencia
-               
-               return sucursales
-       except Exception as e:
-           logging.error(f"Error en distribución: {e}")
-           return {self.id_nodo: cantidad_total}  # Fallback a nodo actual
-
+    def redistribuir_articulos(self, datos_redistribucion):
+        """Redistribuye artículos cuando una sucursal falla"""
+        if not self.es_maestro and self.maestro_actual != self.id_nodo:
+            return {'estado': 'error', 'mensaje': 'Solo el maestro puede redistribuir'}
+            
+        with self.lock:
+            try:
+                cur = self.db_conn.cursor()
+                
+                # Actualizar inventario general
+                cur.execute("""
+                    UPDATE inventario
+                    SET cantidad_disponible = cantidad_disponible - %s
+                    WHERE id_articulo = %s
+                """, (datos_redistribucion['cantidad'], datos_redistribucion['id_articulo']))
+                
+                # Distribuir a otras sucursales
+                for sucursal, cantidad in datos_redistribucion['nueva_distribucion'].items():
+                    cur.execute("""
+                        UPDATE distribucion_sucursal
+                        SET cantidad = cantidad + %s,
+                            espacio_disponible = espacio_disponible - %s
+                        WHERE id_articulo = %s AND id_sucursal = %s
+                    """, (cantidad, cantidad, datos_redistribucion['id_articulo'], sucursal))
+                
+                self.db_conn.commit()
+                return {'estado': 'ok'}
+            except Exception as e:
+                self.db_conn.rollback()
+                logging.error(f"Error redistribuyendo artículos: {e}")
+                return {'estado': 'error', 'mensaje': str(e)}
     
     # Funciones para elección de maestro
     def verificar_maestro(self):
@@ -551,44 +551,50 @@ class NodoInventario:
     
     # Interfaz de usuario
     def interfaz_usuario(self):
-        """Menú interactivo"""
+        """Interfaz para interactuar con el sistema"""
         while self.activo:
-            print("\n=== SISTEMA DE INVENTARIO ===")
-            print(f"Nodo {self.id_nodo} | {'MAESTRO' if self.es_maestro else 'SLAVE'}")
-            print("1. Consultar inventario")
-            print("2. Vender artículo")
-            print("3. Agregar artículo")
-            print("4. Salir")
+            print("\n=== SISTEMA DE INVENTARIO DISTRIBUIDO ===")
+            print(f"Nodo: {self.id_nodo} | {'MAESTRO' if self.es_maestro else 'SUCURSAL'}")
+            print("1. Consultar inventario local")
+            print("2. Consultar clientes")
+            print("3. Vender artículo")
+            print("4. Agregar artículo al sistema")
+            print("5. Ver estado del sistema")
+            print("6. Salir")
+            
+            opcion = input("Seleccione una opción: ")
             
             try:
-                opcion = input("Seleccione: ")
-                
                 if opcion == '1':
-                    self._mostrar_inventario()
+                    self.mostrar_inventario()
                 elif opcion == '2':
-                    self._procesar_venta_ui()
+                    self.mostrar_clientes()
                 elif opcion == '3':
-                    self._agregar_articulo_ui()
+                    self.procesar_venta_ui()
                 elif opcion == '4':
+                    self.agregar_articulo_ui()
+                elif opcion == '5':
+                    self.mostrar_estado()
+                elif opcion == '6':
                     self.activo = False
+                    print("Saliendo del sistema...")
                 else:
                     print("Opción no válida")
-                    
             except Exception as e:
                 print(f"Error: {str(e)}")
     
-    def _mostrar_inventario(self):
-        """Muestra inventario local"""
-        resultado = self.consultar_inventario()
-        if resultado['estado'] == 'ok':
-            print("\n=== INVENTARIO ===")
-            for item in resultado['inventario']:
-                print(f"ID: {item['id']} | {item['nombre']}")
-                print(f"  Stock: {item['cantidad']} | Precio: ${item['precio']:.2f}")
+    def mostrar_inventario(self):
+        """Muestra el inventario local"""
+        inventario = self.consultar_inventario()
+        if inventario['estado'] == 'ok':
+            print("\n=== INVENTARIO LOCAL ===")
+            for item in inventario['inventario']:
+                print(f"ID: {item['id_articulo']} | {item['nombre']}")
+                print(f"  Descripción: {item['descripcion']}")
+                print(f"  Cantidad: {item['cantidad']} | Total sistema: {item['cantidad_total']}")
                 print("-" * 40)
         else:
-            print(f"Error: {resultado['mensaje']}")
-
+            print(f"Error: {inventario['mensaje']}")
     
     def mostrar_clientes(self):
         """Muestra la lista de clientes"""
@@ -604,51 +610,43 @@ class NodoInventario:
         else:
             print(f"Error: {clientes['mensaje']}")
     
-    def _procesar_venta_ui(self):
-        """Interfaz para ventas"""
-        print("\n=== VENDER ARTÍCULO ===")
-        try:
-            id_articulo = int(input("ID Artículo: "))
-            id_cliente = int(input("ID Cliente: "))
-            cantidad = int(input("Cantidad: "))
-            
-            resultado = self.procesar_venta({
-                'id_articulo': id_articulo,
-                'id_cliente': id_cliente,
-                'cantidad': cantidad
-            })
-            
-            if resultado['estado'] == 'ok':
-                print(f"\n✅ Venta registrada. Guía: {resultado['guia']}")
-            else:
-                print(f"\n❌ Error: {resultado['mensaje']}")
-                
-        except ValueError:
-            print("Error: Ingresa valores numéricos")
+    def procesar_venta_ui(self):
+        """Interfaz para procesar una venta"""
+        print("\n=== PROCESAR VENTA ===")
+        id_articulo = int(input("ID del artículo: "))
+        id_cliente = int(input("ID del cliente: "))
+        cantidad = int(input("Cantidad a vender: "))
+        
+        resultado = self.procesar_venta({
+            'id_articulo': id_articulo,
+            'id_cliente': id_cliente,
+            'cantidad': cantidad
+        })
+        
+        if resultado['estado'] == 'ok':
+            print(f"\n✅ Venta realizada correctamente")
+            print(f"Guía de envío: {resultado['guia_envio']}")
+        else:
+            print(f"\n❌ Error: {resultado['mensaje']}")
     
-    def _agregar_articulo_ui(self):
-        """Interfaz para agregar artículos"""
+    def agregar_articulo_ui(self):
+        """Interfaz para agregar un nuevo artículo"""
         print("\n=== AGREGAR ARTÍCULO ===")
-        try:
-            nombre = input("Nombre: ")
-            descripcion = input("Descripción: ")
-            cantidad = int(input("Cantidad inicial: "))
-            precio = float(input("Precio de venta: "))
-            
-            resultado = self.agregar_articulo({
-                'nombre': nombre,
-                'descripcion': descripcion,
-                'cantidad': cantidad,
-                'precio_venta': precio
-            })
-            
-            if resultado['estado'] == 'ok':
-                print(f"\n✅ Artículo agregado (ID: {resultado['id_articulo']})")
-            else:
-                print(f"\n❌ Error: {resultado['mensaje']}")
-                
-        except ValueError:
-            print("Error: Ingresa valores válidos")
+        nombre = input("Nombre del artículo: ")
+        descripcion = input("Descripción: ")
+        cantidad = int(input("Cantidad inicial: "))
+        
+        resultado = self.agregar_articulo({
+            'nombre': nombre,
+            'descripcion': descripcion,
+            'cantidad': cantidad
+        })
+        
+        if resultado['estado'] == 'ok':
+            print(f"\n✅ Artículo agregado correctamente")
+            print(f"ID asignado: {resultado['id_articulo']}")
+        else:
+            print(f"\n❌ Error: {resultado['mensaje']}")
     
     def mostrar_estado(self):
         """Muestra el estado del sistema"""
@@ -678,11 +676,13 @@ class NodoInventario:
 def iniciar_nodo_inventario(config):
     """Inicia un nodo del sistema de inventario"""
     nodo = NodoInventario(
-        id_nodo=config['id'],
+        id_nodo=config['id_nodo'],
         puerto=config['puerto'],
         nodos_conocidos=config['nodos_conocidos'],
         es_maestro=(config['id'] == 1)  # El nodo 1 es maestro inicial
-    ) 
+        db.config=config['db_config']
+    )
+    
     # Iniciar servidor en segundo plano
     threading.Thread(target=nodo.servidor, daemon=True).start()
     
@@ -723,6 +723,15 @@ if __name__ == "__main__":
         'id': id_nodo,
         'puerto': TODOS_NODOS[id_nodo][1],
         'nodos_conocidos': TODOS_NODOS
+
+        'db_config': {
+            'dabase': 'inventario_distribuido',
+                'user': 'postgres',
+                'password': '1234',
+                'host': 'localhost',
+                'port': 5432
+
+    }
     }
     
     # Configurar PostgreSQL antes de iniciar
